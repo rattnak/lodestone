@@ -199,6 +199,14 @@ func (ix *Index) Delete(id uint64) error {
 // the search width: recall rises with it at the cost of latency; values
 // below k are raised to k, and 0 means "use max(k, 64)".
 func (ix *Index) Search(query []float32, k, ef int) ([]Result, error) {
+	return ix.SearchFilter(query, k, ef, nil)
+}
+
+// SearchFilter is Search restricted to IDs for which allow returns true
+// (post-filtering: the graph is traversed unfiltered and disallowed hits are
+// dropped from the result set). With a selective filter, raise ef so enough
+// allowed candidates survive — a filter keeping 1-in-10 wants ef around 10x.
+func (ix *Index) SearchFilter(query []float32, k, ef int, allow func(id uint64) bool) ([]Result, error) {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	if ix.entry < 0 {
@@ -219,13 +227,15 @@ func (ix *Index) Search(query []float32, k, ef int) ([]Result, error) {
 	eps := []candidate{{idx: ep, dist: ix.opts.Distance(query, ix.nodes[ep].vec)}}
 	found := ix.searchLayer(query, eps, ef, 0)
 
-	live := found[:0]
+	keep := found[:0]
 	for _, c := range found {
-		if !ix.nodes[c.idx].deleted {
-			live = append(live, c)
+		n := &ix.nodes[c.idx]
+		if n.deleted || (allow != nil && !allow(n.id)) {
+			continue
 		}
+		keep = append(keep, c)
 	}
-	res := selectClosest(live, k)
+	res := selectClosest(keep, k)
 	out := make([]Result, len(res))
 	for i, c := range res {
 		out[i] = Result{ID: ix.nodes[c.idx].id, Score: c.dist}
