@@ -20,17 +20,20 @@ import (
 //	                  key     [keyLen]byte
 //	                  valLen  uvarint  // 0 for tombstones
 //	                  value   [valLen]byte
+//	bloom section:  k uvarint | wordCount uvarint | words []uint64 LE
 //	index section:  count uvarint, then per sparse entry
 //	                  keyLen uvarint | key | offset uvarint
-//	footer (20B):   indexOffset uint64 | entryCount uint64 | magic uint32
+//	footer (28B):   bloomOffset uint64 | indexOffset uint64 |
+//	                entryCount uint64 | magic uint32
 //
 // The sparse index holds every sstIndexInterval-th key (always including the
 // first), so a lookup binary-searches the in-memory index and scans at most
-// one interval of the data section.
+// one interval of the data section. The bloom filter is consulted before any
+// of that, so lookups for keys the table lacks usually touch no disk at all.
 const (
 	sstMagic         = 0x4c4f4445 // "LODE"
 	sstIndexInterval = 16
-	sstFooterSize    = 20
+	sstFooterSize    = 28
 )
 
 var ErrNotSorted = errors.New("sstable: entries not in strictly ascending key order")
@@ -62,6 +65,7 @@ func WriteSSTable(path string, entries iter.Seq2[[]byte, Entry]) (err error) {
 		offset  int64
 		count   uint64
 		index   []sstIndexEntry
+		hashes  [][2]uint64
 		prevKey []byte
 		scratch [binary.MaxVarintLen64]byte
 	)
@@ -79,6 +83,8 @@ func WriteSSTable(path string, entries iter.Seq2[[]byte, Entry]) (err error) {
 		if count%sstIndexInterval == 0 {
 			index = append(index, sstIndexEntry{key: append([]byte(nil), key...), offset: offset})
 		}
+		h1, h2 := bloomHash(key)
+		hashes = append(hashes, [2]uint64{h1, h2})
 		var flags byte
 		value := ent.Value
 		if ent.Tombstone {
@@ -109,6 +115,26 @@ func WriteSSTable(path string, entries iter.Seq2[[]byte, Entry]) (err error) {
 		return errors.New("sstable: refusing to write empty table")
 	}
 
+	bloomOffset := offset
+	filter := newBloomFilter(len(hashes))
+	for _, h := range hashes {
+		filter.add(h[0], h[1])
+	}
+	if err = writeUvarint(uint64(filter.k)); err != nil {
+		return err
+	}
+	if err = writeUvarint(uint64(len(filter.bits))); err != nil {
+		return err
+	}
+	var word [8]byte
+	for _, v := range filter.bits {
+		binary.LittleEndian.PutUint64(word[:], v)
+		if _, err = w.Write(word[:]); err != nil {
+			return err
+		}
+		offset += 8
+	}
+
 	indexOffset := offset
 	if err = writeUvarint(uint64(len(index))); err != nil {
 		return err
@@ -125,9 +151,10 @@ func WriteSSTable(path string, entries iter.Seq2[[]byte, Entry]) (err error) {
 		}
 	}
 	var footer [sstFooterSize]byte
-	binary.LittleEndian.PutUint64(footer[0:8], uint64(indexOffset))
-	binary.LittleEndian.PutUint64(footer[8:16], count)
-	binary.LittleEndian.PutUint32(footer[16:20], sstMagic)
+	binary.LittleEndian.PutUint64(footer[0:8], uint64(bloomOffset))
+	binary.LittleEndian.PutUint64(footer[8:16], uint64(indexOffset))
+	binary.LittleEndian.PutUint64(footer[16:24], count)
+	binary.LittleEndian.PutUint32(footer[24:28], sstMagic)
 	if _, err = w.Write(footer[:]); err != nil {
 		return err
 	}
@@ -147,10 +174,12 @@ func WriteSSTable(path string, entries iter.Seq2[[]byte, Entry]) (err error) {
 // each reads through its own SectionReader rather than seeking the shared
 // file handle.
 type SSTable struct {
-	f           *os.File
-	index       []sstIndexEntry
-	indexOffset int64
-	count       uint64
+	f       *os.File
+	path    string
+	index   []sstIndexEntry
+	bloom   *bloomFilter
+	dataEnd int64 // end of the data section
+	count   uint64
 }
 
 func OpenSSTable(path string) (*SSTable, error) {
@@ -163,6 +192,7 @@ func OpenSSTable(path string) (*SSTable, error) {
 		f.Close()
 		return nil, fmt.Errorf("sstable %s: %w", path, err)
 	}
+	st.path = path
 	return st, nil
 }
 
@@ -178,18 +208,42 @@ func loadSSTable(f *os.File) (*SSTable, error) {
 	if _, err := f.ReadAt(footer[:], fi.Size()-sstFooterSize); err != nil {
 		return nil, err
 	}
-	if binary.LittleEndian.Uint32(footer[16:20]) != sstMagic {
+	if binary.LittleEndian.Uint32(footer[24:28]) != sstMagic {
 		return nil, errors.New("bad magic")
 	}
+	bloomOffset := int64(binary.LittleEndian.Uint64(footer[0:8]))
+	indexOffset := int64(binary.LittleEndian.Uint64(footer[8:16]))
 	st := &SSTable{
-		f:           f,
-		indexOffset: int64(binary.LittleEndian.Uint64(footer[0:8])),
-		count:       binary.LittleEndian.Uint64(footer[8:16]),
+		f:       f,
+		dataEnd: bloomOffset,
+		count:   binary.LittleEndian.Uint64(footer[16:24]),
 	}
-	if st.indexOffset < 0 || st.indexOffset > fi.Size()-sstFooterSize {
-		return nil, errors.New("index offset out of range")
+	if bloomOffset < 0 || indexOffset < bloomOffset || indexOffset > fi.Size()-sstFooterSize {
+		return nil, errors.New("section offsets out of range")
 	}
-	r := bufio.NewReader(io.NewSectionReader(f, st.indexOffset, fi.Size()-sstFooterSize-st.indexOffset))
+
+	br := bufio.NewReader(io.NewSectionReader(f, bloomOffset, indexOffset-bloomOffset))
+	k, err := binary.ReadUvarint(br)
+	if err != nil {
+		return nil, err
+	}
+	words, err := binary.ReadUvarint(br)
+	if err != nil {
+		return nil, err
+	}
+	if k == 0 || k > 64 || words > uint64(indexOffset-bloomOffset) {
+		return nil, errors.New("bad bloom header")
+	}
+	st.bloom = &bloomFilter{bits: make([]uint64, words), k: uint32(k)}
+	var word [8]byte
+	for i := range st.bloom.bits {
+		if _, err := io.ReadFull(br, word[:]); err != nil {
+			return nil, err
+		}
+		st.bloom.bits[i] = binary.LittleEndian.Uint64(word[:])
+	}
+
+	r := bufio.NewReader(io.NewSectionReader(f, indexOffset, fi.Size()-sstFooterSize-indexOffset))
 	n, err := binary.ReadUvarint(r)
 	if err != nil {
 		return nil, err
@@ -216,6 +270,9 @@ func loadSSTable(f *os.File) (*SSTable, error) {
 // Get looks up key. ok is false when the table holds nothing for the key;
 // a returned tombstone means the key was deleted as of this table.
 func (s *SSTable) Get(key []byte) (ent Entry, ok bool, err error) {
+	if !s.bloom.mayContain(key) {
+		return Entry{}, false, nil // definite miss, no disk touched
+	}
 	// Last sparse entry with key <= target starts the scan interval.
 	i := sort.Search(len(s.index), func(i int) bool {
 		return bytes.Compare(s.index[i].key, key) > 0
@@ -224,7 +281,7 @@ func (s *SSTable) Get(key []byte) (ent Entry, ok bool, err error) {
 		return Entry{}, false, nil // key sorts before the table's first key
 	}
 	start := s.index[i-1].offset
-	r := bufio.NewReader(io.NewSectionReader(s.f, start, s.indexOffset-start))
+	r := bufio.NewReader(io.NewSectionReader(s.f, start, s.dataEnd-start))
 	for {
 		k, e, rerr := readSSTEntry(r)
 		if errors.Is(rerr, io.EOF) {
@@ -248,7 +305,7 @@ func (s *SSTable) Get(key []byte) (ent Entry, ok bool, err error) {
 func (s *SSTable) All() (iter.Seq2[[]byte, Entry], *error) {
 	var iterErr error
 	seq := func(yield func([]byte, Entry) bool) {
-		r := bufio.NewReader(io.NewSectionReader(s.f, 0, s.indexOffset))
+		r := bufio.NewReader(io.NewSectionReader(s.f, 0, s.dataEnd))
 		for {
 			k, e, err := readSSTEntry(r)
 			if errors.Is(err, io.EOF) {
