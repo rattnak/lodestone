@@ -1,0 +1,90 @@
+// Lodestone wire protocol. Protobuf is the schema-evolution story (DDIA ch
+// 4): fields are tagged, unknown fields pass through unharmed, and old
+// clients keep working against new servers as long as tags are never reused
+// or repurposed.
+syntax = "proto3";
+
+package lodestone.v1;
+
+option go_package = "github.com/rattnak/lodestone/internal/server/pb;pb";
+
+service Lodestone {
+  // Key-value operations on the storage engine.
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Document operations: a payload stored by id plus a vector indexed for
+  // similarity search.
+  rpc UpsertDocument(UpsertDocumentRequest) returns (UpsertDocumentResponse);
+  rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
+  rpc SearchVectors(SearchVectorsRequest) returns (SearchVectorsResponse);
+
+  // Server-streamed snapshots of engine and index state, for the dashboard.
+  rpc WatchTelemetry(WatchTelemetryRequest) returns (stream TelemetrySnapshot);
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+message PutResponse {}
+
+message GetRequest {
+  bytes key = 1;
+}
+message GetResponse {
+  bytes value = 1;
+  bool found = 2;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+message DeleteResponse {}
+
+message UpsertDocumentRequest {
+  uint64 id = 1;
+  repeated float vector = 2;
+  bytes payload = 3;
+}
+message UpsertDocumentResponse {}
+
+message DeleteDocumentRequest {
+  uint64 id = 1;
+}
+message DeleteDocumentResponse {}
+
+message SearchVectorsRequest {
+  repeated float vector = 1;
+  uint32 k = 2;
+  // Search beam width; 0 lets the server choose.
+  uint32 ef = 3;
+  bool include_payloads = 4;
+}
+
+message SearchVectorsResponse {
+  repeated SearchHit hits = 1;
+}
+
+message SearchHit {
+  uint64 id = 1;
+  // Distance to the query: lower is closer.
+  float score = 2;
+  bytes payload = 3;
+}
+
+message WatchTelemetryRequest {
+  // Snapshot interval; 0 means the server default (1s).
+  uint32 interval_ms = 1;
+}
+
+message TelemetrySnapshot {
+  int64 unix_ms = 1;
+  uint64 memtable_bytes = 2;
+  uint32 sstable_count = 3;
+  uint64 indexed_vectors = 4;
+  uint64 puts_total = 5;
+  uint64 gets_total = 6;
+  uint64 searches_total = 7;
+}
