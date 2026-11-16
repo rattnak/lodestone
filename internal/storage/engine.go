@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"sort"
@@ -257,12 +258,58 @@ func (db *DB) flushLocked() error {
 	return nil
 }
 
+// All yields every live key/value pair in ascending key order — tombstones
+// and shadowed versions resolved — from a point-in-time snapshot of the
+// memtable and tables. Yielded slices may alias internal buffers; copy them
+// if retained. Read errors surface via errCheck after iteration.
+func (db *DB) All() (seq iter.Seq2[[]byte, []byte], errCheck func() error) {
+	db.mu.RLock()
+	mem := db.mem
+	tables := db.tables
+	db.mu.RUnlock()
+
+	seqs := make([]iter.Seq2[[]byte, Entry], 0, len(tables)+1)
+	errPtrs := make([]*error, 0, len(tables))
+	seqs = append(seqs, mem.All()) // newest source first
+	for _, t := range tables {
+		s, errp := t.All()
+		seqs = append(seqs, s)
+		errPtrs = append(errPtrs, errp)
+	}
+	merged := mergeSeqs(seqs)
+	seq = func(yield func([]byte, []byte) bool) {
+		for k, e := range merged {
+			if e.Tombstone {
+				continue
+			}
+			if !yield(k, e.Value) {
+				return
+			}
+		}
+	}
+	errCheck = func() error {
+		var errs []error
+		for _, p := range errPtrs {
+			errs = append(errs, *p)
+		}
+		return errors.Join(errs...)
+	}
+	return seq, errCheck
+}
+
 // TableCount returns the number of SSTables on disk (for tests, stats, and
 // deciding when to compact).
 func (db *DB) TableCount() int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return len(db.tables)
+}
+
+// MemtableSize returns the memtable's approximate memory usage in bytes.
+func (db *DB) MemtableSize() int64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.mem.Size()
 }
 
 // Close syncs the WAL and releases all file handles. The memtable is not

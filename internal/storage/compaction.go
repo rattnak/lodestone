@@ -65,11 +65,30 @@ func (db *DB) compactLocked() error {
 // table surface via errCheck after iteration.
 func mergeTables(tables []*SSTable) (seq iter.Seq2[[]byte, Entry], errCheck func() error) {
 	errPtrs := make([]*error, len(tables))
-	seq = func(yield func([]byte, Entry) bool) {
-		h := make(mergeHeap, 0, len(tables))
-		for i, t := range tables {
-			s, errp := t.All()
-			errPtrs[i] = errp
+	seqs := make([]iter.Seq2[[]byte, Entry], len(tables))
+	for i, t := range tables {
+		seqs[i], errPtrs[i] = t.All()
+	}
+	seq = mergeSeqs(seqs)
+	errCheck = func() error {
+		var errs []error
+		for _, p := range errPtrs {
+			if p != nil {
+				errs = append(errs, *p)
+			}
+		}
+		return errors.Join(errs...)
+	}
+	return seq, errCheck
+}
+
+// mergeSeqs k-way merges sorted entry sequences into ascending key order,
+// one entry per key; on duplicate keys the lowest-indexed (newest) source
+// wins.
+func mergeSeqs(seqs []iter.Seq2[[]byte, Entry]) iter.Seq2[[]byte, Entry] {
+	return func(yield func([]byte, Entry) bool) {
+		h := make(mergeHeap, 0, len(seqs))
+		for i, s := range seqs {
 			next, stop := iter.Pull2(s)
 			defer stop()
 			if k, e, ok := next(); ok {
@@ -96,16 +115,6 @@ func mergeTables(tables []*SSTable) (seq iter.Seq2[[]byte, Entry], errCheck func
 			}
 		}
 	}
-	errCheck = func() error {
-		var errs []error
-		for _, p := range errPtrs {
-			if p != nil {
-				errs = append(errs, *p)
-			}
-		}
-		return errors.Join(errs...)
-	}
-	return seq, errCheck
 }
 
 type mergeItem struct {

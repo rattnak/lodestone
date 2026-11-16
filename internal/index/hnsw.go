@@ -134,8 +134,12 @@ func (ix *Index) Add(id uint64, vec []float32) error {
 	} else if len(vec) != ix.dim {
 		return fmt.Errorf("%w: got %d, index has %d", ErrDimension, len(vec), ix.dim)
 	}
-	if _, dup := ix.byID[id]; dup {
-		return fmt.Errorf("%w: %d", ErrDuplicate, id)
+	if j, dup := ix.byID[id]; dup {
+		if !ix.nodes[j].deleted {
+			return fmt.Errorf("%w: %d", ErrDuplicate, id)
+		}
+		// Re-adding a deleted id: the old node stays a graph waypoint but
+		// no longer owns the id; the mapping moves to the fresh node below.
 	}
 
 	level := int(math.Floor(-math.Log(ix.rng.Float64()) * ix.mL))
