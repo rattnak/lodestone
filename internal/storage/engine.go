@@ -20,10 +20,13 @@ type Options struct {
 	// to true; turning it off trades the last few writes in a crash for
 	// throughput.
 	SyncWrites bool
+	// CompactAtTables triggers a full compaction when a flush leaves this
+	// many SSTables. Defaults to 4.
+	CompactAtTables int
 }
 
 func defaultOptions() Options {
-	return Options{MemtableBytes: 4 << 20, SyncWrites: true}
+	return Options{MemtableBytes: 4 << 20, SyncWrites: true, CompactAtTables: 4}
 }
 
 // DB is the single-node storage engine: an LSM tree.
@@ -57,6 +60,9 @@ func Open(dir string, opts *Options) (*DB, error) {
 	if opts != nil {
 		if opts.MemtableBytes > 0 {
 			o.MemtableBytes = opts.MemtableBytes
+		}
+		if opts.CompactAtTables > 0 {
+			o.CompactAtTables = opts.CompactAtTables
 		}
 		o.SyncWrites = opts.SyncWrites
 	}
@@ -163,7 +169,12 @@ func (db *DB) apply(rec Record) error {
 		db.mem.Put(rec.Key, rec.Value)
 	}
 	if db.mem.Size() >= db.opts.MemtableBytes {
-		return db.flushLocked()
+		if err := db.flushLocked(); err != nil {
+			return err
+		}
+		if len(db.tables) >= db.opts.CompactAtTables {
+			return db.compactLocked()
+		}
 	}
 	return nil
 }
