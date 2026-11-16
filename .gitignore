@@ -1,0 +1,24 @@
+# Binaries
+/lodestone
+/bin/
+*.exe
+
+# Test and profiling artifacts
+*.test
+*.out
+*.prof
+coverage.*
+
+# Data directories created by local runs
+/data/
+*.wal
+*.sst
+
+# Dashboard
+dashboard/node_modules/
+dashboard/dist/
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
