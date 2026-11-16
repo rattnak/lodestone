@@ -9,12 +9,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rattnak/lodestone/internal/embed"
 	"github.com/rattnak/lodestone/internal/index"
+	"github.com/rattnak/lodestone/internal/server"
 )
 
 func main() {
@@ -23,6 +27,11 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "serve":
+		if err := runServe(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	case "search":
 		if err := runSearch(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -36,11 +45,43 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
+  lodestone serve  -data <dir> [-addr :7437]
   lodestone search -file <texts.txt> -query "..." [-k 5] [-ollama URL] [-model NAME]
 
-Embeds each line of the file, indexes the vectors in HNSW, then answers the
-query semantically. Requires a running Ollama with an embedding model:
+serve runs a lodestone node: KV + vector search over gRPC.
+
+search is a self-contained demo: embeds each line of the file, indexes the
+vectors in HNSW, then answers the query semantically. Requires a running
+Ollama with an embedding model:
   ollama pull nomic-embed-text`)
+}
+
+func runServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", ":7437", "listen address")
+	data := fs.String("data", "", "data directory")
+	fs.Parse(args)
+	if *data == "" {
+		return fmt.Errorf("-data is required")
+	}
+
+	srv, err := server.New(*data, nil)
+	if err != nil {
+		return err
+	}
+	lis, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return err
+	}
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		fmt.Fprintln(os.Stderr, "shutting down...")
+		srv.Stop()
+	}()
+	fmt.Fprintf(os.Stderr, "lodestone serving on %s, data in %s\n", *addr, *data)
+	return srv.Serve(lis)
 }
 
 func runSearch(args []string) error {
