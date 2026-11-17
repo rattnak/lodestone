@@ -19,6 +19,9 @@ type HardState struct {
 	SnapData []byte
 	SnapIndex uint64
 	SnapTerm  uint64
+	// Peers is the membership from applied conf changes; nil means "never
+	// changed — use the bootstrap configuration".
+	Peers []string
 }
 
 // Storage persists Raft hard state. Every method must be durable when it
@@ -31,6 +34,8 @@ type Storage interface {
 	Append(entries []Entry) error
 	// SetSnapshot stores the snapshot and discards log entries <= index.
 	SetSnapshot(data []byte, index, term uint64) error
+	// SetPeers records the membership after an applied conf change.
+	SetPeers(peers []string) error
 }
 
 // MemoryStorage keeps hard state in memory. The simulator "crashes" nodes by
@@ -75,6 +80,13 @@ func (m *MemoryStorage) Append(entries []Entry) error {
 	return nil
 }
 
+func (m *MemoryStorage) SetPeers(peers []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hs.Peers = append([]string(nil), peers...)
+	return nil
+}
+
 func (m *MemoryStorage) SetSnapshot(data []byte, index, term uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -104,9 +116,10 @@ type WALStorage struct {
 // WAL record keys (values carry the payload):
 const (
 	walKeyState    = "s" // value: term uvarint | votedFor
-	walKeyEntry    = "e" // value: index | term uvarints | data
+	walKeyEntry    = "e" // value: index | term uvarints | type byte | data
 	walKeyTruncate = "t" // value: fromIndex uvarint — discard entries >= from
 	walKeySnap     = "p" // value: index | term uvarints | snapshot data
+	walKeyPeers    = "m" // value: count uvarint | (len uvarint | id)...
 )
 
 func OpenWALStorage(dir string) (*WALStorage, error) {
@@ -140,11 +153,22 @@ func (w *WALStorage) replay(key string, val []byte) {
 	case walKeyEntry:
 		index, n1 := binary.Uvarint(val)
 		term, n2 := binary.Uvarint(val[n1:])
+		typ := EntryType(val[n1+n2])
 		w.truncateFrom(index)
-		w.hs.Log = append(w.hs.Log, Entry{Index: index, Term: term, Data: val[n1+n2:]})
+		w.hs.Log = append(w.hs.Log, Entry{Index: index, Term: term, Type: typ, Data: val[n1+n2+1:]})
 	case walKeyTruncate:
 		from, _ := binary.Uvarint(val)
 		w.truncateFrom(from)
+	case walKeyPeers:
+		count, n := binary.Uvarint(val)
+		peers := make([]string, 0, count)
+		for i := uint64(0); i < count; i++ {
+			l, n2 := binary.Uvarint(val[n:])
+			n += n2
+			peers = append(peers, string(val[n:n+int(l)]))
+			n += int(l)
+		}
+		w.hs.Peers = peers
 	case walKeySnap:
 		index, n1 := binary.Uvarint(val)
 		term, n2 := binary.Uvarint(val[n1:])
@@ -203,10 +227,7 @@ func (w *WALStorage) Append(entries []Entry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, e := range entries {
-		val := binary.AppendUvarint(nil, e.Index)
-		val = binary.AppendUvarint(val, e.Term)
-		val = append(val, e.Data...)
-		if err := w.wal.Append(storage.Record{Op: storage.OpPut, Key: []byte(walKeyEntry), Value: val}); err != nil {
+		if err := w.wal.Append(storage.Record{Op: storage.OpPut, Key: []byte(walKeyEntry), Value: encodeWALEntry(e)}); err != nil {
 			return err
 		}
 	}
@@ -251,10 +272,11 @@ func (w *WALStorage) SetSnapshot(data []byte, index, term uint64) error {
 	write(walKeySnap, append(snapVal, data...))
 	stateVal := binary.AppendUvarint(nil, w.hs.Term)
 	write(walKeyState, append(stateVal, w.hs.VotedFor...))
+	if w.hs.Peers != nil {
+		write(walKeyPeers, encodeWALPeers(w.hs.Peers))
+	}
 	for _, e := range w.hs.Log {
-		val := binary.AppendUvarint(nil, e.Index)
-		val = binary.AppendUvarint(val, e.Term)
-		write(walKeyEntry, append(val, e.Data...))
+		write(walKeyEntry, encodeWALEntry(e))
 	}
 	if err != nil {
 		nw.Close()
@@ -273,6 +295,32 @@ func (w *WALStorage) SetSnapshot(data []byte, index, term uint64) error {
 	}
 	w.wal, err = storage.OpenWAL(w.path())
 	return err
+}
+
+func encodeWALEntry(e Entry) []byte {
+	val := binary.AppendUvarint(nil, e.Index)
+	val = binary.AppendUvarint(val, e.Term)
+	val = append(val, byte(e.Type))
+	return append(val, e.Data...)
+}
+
+func encodeWALPeers(peers []string) []byte {
+	val := binary.AppendUvarint(nil, uint64(len(peers)))
+	for _, p := range peers {
+		val = binary.AppendUvarint(val, uint64(len(p)))
+		val = append(val, p...)
+	}
+	return val
+}
+
+func (w *WALStorage) SetPeers(peers []string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.appendRecord(walKeyPeers, encodeWALPeers(peers)); err != nil {
+		return err
+	}
+	w.hs.Peers = append([]string(nil), peers...)
+	return nil
 }
 
 func (w *WALStorage) Close() error {

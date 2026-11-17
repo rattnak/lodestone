@@ -136,6 +136,16 @@ func (c *Cluster) start(id string) {
 // Crash removes the node (RAM lost), keeping its storage (disk intact).
 func (c *Cluster) Crash(id string) { delete(c.nodes, id) }
 
+// AddNode boots a brand-new node (empty storage) that bootstraps against the
+// current members. The caller must still commit the membership change via
+// ProposeConfChange on the leader for voting rights.
+func (c *Cluster) AddNode(id string) {
+	c.ids = append(c.ids, id)
+	c.stores[id] = NewMemoryStorage()
+	c.seeds[id] = c.rng.Int63()
+	c.start(id)
+}
+
 // Restart reboots a crashed node from its persisted state.
 func (c *Cluster) Restart(id string) {
 	if _, up := c.nodes[id]; up {
@@ -291,7 +301,8 @@ func (c *Cluster) recordApply(id string, e Entry) {
 			fmt.Sprintf("%s applied index %d, expected %d (gap or replay)", id, e.Index, want))
 	}
 	c.appliedIdx[id] = e.Index
-	if len(e.Data) > 0 { // leader no-ops consume an index but aren't commands
+	// Leader no-ops and conf changes consume indexes but aren't commands.
+	if e.Type == EntryNormal && len(e.Data) > 0 {
 		c.applied[id] = append(c.applied[id], e)
 	}
 

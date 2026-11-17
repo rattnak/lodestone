@@ -10,6 +10,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -27,13 +29,34 @@ func (s StateType) String() string {
 	return [...]string{"follower", "candidate", "leader"}[s]
 }
 
+// EntryType distinguishes client commands from cluster-management entries.
+type EntryType byte
+
+const (
+	// EntryNormal carries a client command (empty Data = leader no-op).
+	EntryNormal EntryType = iota
+	// EntryConfChange carries an encoded ConfChange; applying it changes
+	// the voting membership.
+	EntryConfChange
+)
+
 // Entry is one log record. Index and Term identify it uniquely across the
 // cluster; equal (Index, Term) implies equal Data and equal preceding logs —
 // the Log Matching property.
 type Entry struct {
 	Index uint64
 	Term  uint64
+	Type  EntryType
 	Data  []byte
+}
+
+// ConfChange adds or removes a single voting member. Only one change may be
+// in flight at a time (the single-server approach, §4.1): one-at-a-time
+// changes keep old and new quorums overlapping, which is what makes the
+// transition safe without joint consensus.
+type ConfChange struct {
+	Add    bool
+	NodeID string
 }
 
 type MsgType int
@@ -86,6 +109,20 @@ type Transport interface {
 	Send(msg Message)
 }
 
+func EncodeConfChange(cc ConfChange) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(cc); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func DecodeConfChange(data []byte) (ConfChange, error) {
+	var cc ConfChange
+	err := gob.NewDecoder(bytes.NewReader(data)).Decode(&cc)
+	return cc, err
+}
+
 // Config assembles a node. Tick granularity: election timeouts are drawn
 // uniformly from [ElectionTicks, 2*ElectionTicks); heartbeats fire every
 // HeartbeatTicks. Typical: 10 and 1 with a 10-50ms tick.
@@ -125,6 +162,7 @@ type Node struct {
 	term     uint64
 	votedFor string
 	leaderID string
+	removed  bool // applied own removal: never campaign again
 
 	// log[0] corresponds to index snapIndex+1.
 	log       []Entry
@@ -185,6 +223,11 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	n.term, n.votedFor, n.log = st.Term, st.VotedFor, st.Log
 	n.snapData, n.snapIndex, n.snapTerm = st.SnapData, st.SnapIndex, st.SnapTerm
+	if st.Peers != nil {
+		// Persisted membership (from applied conf changes) overrides the
+		// bootstrap list.
+		n.peers = st.Peers
+	}
 	if n.snapIndex > 0 {
 		n.commitIndex, n.lastApplied = n.snapIndex, n.snapIndex
 		if n.restore != nil && len(n.snapData) > 0 {
@@ -263,7 +306,7 @@ func (n *Node) Tick() {
 		}
 	default:
 		n.electionElapsed++
-		if n.electionElapsed >= n.electionTimeout {
+		if n.electionElapsed >= n.electionTimeout && !n.removed {
 			n.startElection()
 		}
 	}
@@ -584,10 +627,90 @@ func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		e := n.log[n.lastApplied-n.snapIndex-1]
+		if e.Type == EntryConfChange {
+			n.applyConfChange(e)
+		}
 		if n.apply != nil {
 			n.apply(e)
 		}
 	}
+}
+
+func (n *Node) applyConfChange(e Entry) {
+	cc, err := DecodeConfChange(e.Data)
+	if err != nil {
+		panic(fmt.Sprintf("raft %s: corrupt conf change at %d: %v", n.id, e.Index, err))
+	}
+	if cc.NodeID == n.id {
+		// Adding self is a no-op (we're here). On removal, step down and
+		// stop campaigning — a removed node's elections would only
+		// disturb the remaining members (§4.2.3); the hosting layer
+		// shuts it down.
+		if !cc.Add {
+			n.state = Follower
+			n.removed = true
+		}
+		return
+	}
+	peers := make([]string, 0, len(n.peers)+1)
+	for _, p := range n.peers {
+		if p != cc.NodeID {
+			peers = append(peers, p)
+		}
+	}
+	if cc.Add {
+		peers = append(peers, cc.NodeID)
+		if n.state == Leader {
+			n.nextIndex[cc.NodeID] = n.lastIndex() + 1
+			n.matchIndex[cc.NodeID] = 0
+		}
+	} else {
+		delete(n.nextIndex, cc.NodeID)
+		delete(n.matchIndex, cc.NodeID)
+		delete(n.lastAck, cc.NodeID)
+	}
+	n.peers = peers
+	if err := n.store.SetPeers(peers); err != nil {
+		panic(fmt.Sprintf("raft %s: persisting membership: %v", n.id, err))
+	}
+	if n.state == Leader {
+		// A removal can shrink the quorum enough to commit waiting
+		// entries.
+		n.maybeCommit()
+	}
+}
+
+// ProposeConfChange appends a membership change if this node is leader and
+// no other change is still uncommitted (one at a time keeps quorums
+// overlapping).
+func (n *Node) ProposeConfChange(cc ConfChange) (index uint64, ok bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state != Leader {
+		return 0, false
+	}
+	for _, e := range n.entriesFrom(n.commitIndex + 1) {
+		if e.Type == EntryConfChange {
+			return 0, false // one in flight already
+		}
+	}
+	data, err := EncodeConfChange(cc)
+	if err != nil {
+		return 0, false
+	}
+	e := Entry{Index: n.lastIndex() + 1, Term: n.term, Type: EntryConfChange, Data: data}
+	n.log = append(n.log, e)
+	n.mustAppend([]Entry{e})
+	n.broadcastAppend()
+	n.maybeCommit()
+	return e.Index, true
+}
+
+// Peers returns the node's current view of the other voting members.
+func (n *Node) Peers() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string(nil), n.peers...)
 }
 
 // --- snapshots ---
