@@ -1,0 +1,65 @@
+// Cluster-internal RPCs: Raft message transport between nodes, membership
+// administration, and partition-pinned operations used by request routing.
+syntax = "proto3";
+
+package lodestone.v1;
+
+import "lodestone/v1/lodestone.proto";
+
+option go_package = "github.com/rattnak/lodestone/internal/server/pb;pb";
+
+service RaftTransport {
+  // Send delivers one Raft message for a group. Fire-and-forget semantics:
+  // the ack carries no data and senders ignore errors (Raft tolerates loss).
+  rpc Send(RaftEnvelope) returns (RaftAck);
+}
+
+message RaftEnvelope {
+  uint32 group = 1;
+  // gob-encoded raft.Message; internal protocol, both ends are this binary.
+  bytes message = 2;
+}
+message RaftAck {}
+
+service ClusterAdmin {
+  // Join registers a new node address in the cluster metadata.
+  rpc Join(JoinRequest) returns (JoinResponse);
+  // Describe reports the node list and every group this node hosts.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+  // SearchPartition runs a vector search pinned to one partition group —
+  // the scatter half of scatter-gather.
+  rpc SearchPartition(SearchPartitionRequest) returns (SearchVectorsResponse);
+}
+
+message JoinRequest {
+  string addr = 1;
+}
+message JoinResponse {
+  repeated string nodes = 1;
+  uint32 partitions = 2;
+}
+
+message DescribeRequest {}
+message DescribeResponse {
+  repeated string nodes = 1;
+  uint32 partitions = 2;
+  repeated GroupInfo groups = 3;
+}
+message GroupInfo {
+  uint32 id = 1;
+  string state = 2;
+  string leader = 3;
+  uint64 term = 4;
+  uint64 last_applied = 5;
+  repeated string members = 6;
+  uint64 keys = 7;
+  uint64 vectors = 8;
+}
+
+message SearchPartitionRequest {
+  uint32 group = 1;
+  repeated float vector = 2;
+  uint32 k = 3;
+  uint32 ef = 4;
+  bool include_payloads = 5;
+}
