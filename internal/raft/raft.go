@@ -134,8 +134,10 @@ type Config struct {
 	// Apply is invoked for each committed entry, in index order, exactly
 	// once per node lifetime (replays happen after restarts — the state
 	// machine must be rebuilt or idempotent). Entries with empty Data are
-	// leader no-ops: they consume an index but carry no command. Called
-	// with internal lock held: it must not call back into the node.
+	// leader no-ops: they consume an index but carry no command. Calls
+	// are serialized and happen outside the node's internal lock, so the
+	// callback may be slow and may read node state, but a Propose from
+	// inside it would deadlock the apply pipeline — don't.
 	Apply func(Entry)
 	// Restore replaces state-machine contents from an installed snapshot.
 	Restore func(data []byte)
@@ -191,6 +193,45 @@ type Node struct {
 	// peer's last successful append reply, used for lease reads.
 	tickCount uint64
 	lastAck   map[string]uint64
+
+	// Committed entries and snapshot restores are queued under mu and
+	// delivered to the Apply/Restore callbacks after it is released,
+	// serialized FIFO by applyMu — callbacks may be slow or take their
+	// own locks without deadlocking the consensus core.
+	applyMu sync.Mutex
+	pending []applyItem
+}
+
+type applyItem struct {
+	entry     Entry
+	restore   []byte
+	isRestore bool
+}
+
+// flushApply delivers queued applies/restores in order. Any goroutine
+// leaving a public entry point calls it; applyMu keeps delivery serial and
+// the FIFO queue keeps it ordered regardless of which goroutine drains.
+func (n *Node) flushApply() {
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+	for {
+		n.mu.Lock()
+		batch := n.pending
+		n.pending = nil
+		n.mu.Unlock()
+		if len(batch) == 0 {
+			return
+		}
+		for _, it := range batch {
+			if it.isRestore {
+				if n.restore != nil {
+					n.restore(it.restore)
+				}
+			} else if n.apply != nil {
+				n.apply(it.entry)
+			}
+		}
+	}
 }
 
 func NewNode(cfg Config) (*Node, error) {
@@ -295,6 +336,7 @@ func (n *Node) mustAppend(entries []Entry) {
 // Tick advances the node's clock by one unit.
 func (n *Node) Tick() {
 	n.mu.Lock()
+	defer n.flushApply()
 	defer n.mu.Unlock()
 	n.tickCount++
 	switch n.state {
@@ -315,6 +357,7 @@ func (n *Node) Tick() {
 // Step delivers one message from the transport.
 func (n *Node) Step(m Message) {
 	n.mu.Lock()
+	defer n.flushApply()
 	defer n.mu.Unlock()
 
 	if m.Term > n.term {
@@ -339,6 +382,7 @@ func (n *Node) Step(m Message) {
 // elsewhere" — the entry was not accepted.
 func (n *Node) Propose(data []byte) (index, term uint64, ok bool) {
 	n.mu.Lock()
+	defer n.flushApply()
 	defer n.mu.Unlock()
 	if n.state != Leader {
 		return 0, 0, false
@@ -628,11 +672,12 @@ func (n *Node) applyCommitted() {
 		n.lastApplied++
 		e := n.log[n.lastApplied-n.snapIndex-1]
 		if e.Type == EntryConfChange {
+			// Membership mutates consensus state: applied inline under
+			// the lock. The user callback still sees the entry via the
+			// queue for index accounting.
 			n.applyConfChange(e)
 		}
-		if n.apply != nil {
-			n.apply(e)
-		}
+		n.pending = append(n.pending, applyItem{entry: e})
 	}
 }
 
@@ -685,6 +730,7 @@ func (n *Node) applyConfChange(e Entry) {
 // overlapping).
 func (n *Node) ProposeConfChange(cc ConfChange) (index uint64, ok bool) {
 	n.mu.Lock()
+	defer n.flushApply()
 	defer n.mu.Unlock()
 	if n.state != Leader {
 		return 0, false
@@ -755,9 +801,7 @@ func (n *Node) handleSnapshot(m Message) {
 	if err := n.store.SetSnapshot(m.SnapData, m.SnapIndex, m.SnapTerm); err != nil {
 		panic(fmt.Sprintf("raft %s: persisting snapshot: %v", n.id, err))
 	}
-	if n.restore != nil {
-		n.restore(m.SnapData)
-	}
+	n.pending = append(n.pending, applyItem{restore: m.SnapData, isRestore: true})
 	reply.Success = true
 	reply.MatchIndex = m.SnapIndex
 	n.trans.Send(reply)

@@ -3,10 +3,8 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"sync/atomic"
 	"time"
@@ -15,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/rattnak/lodestone/internal/doc"
 	"github.com/rattnak/lodestone/internal/index"
 	"github.com/rattnak/lodestone/internal/server/pb"
 	"github.com/rattnak/lodestone/internal/storage"
@@ -40,41 +39,6 @@ type Server struct {
 	searches atomic.Uint64
 }
 
-// docPrefix namespaces document records inside the engine's key space so
-// plain KV keys can never collide with them.
-var docPrefix = []byte("\x00d/")
-
-func docKey(id uint64) []byte {
-	k := make([]byte, len(docPrefix)+8)
-	copy(k, docPrefix)
-	binary.BigEndian.PutUint64(k[len(docPrefix):], id)
-	return k
-}
-
-// Document values: dim uvarint | vector [dim]f32 LE | payload (rest).
-func encodeDoc(vector []float32, payload []byte) []byte {
-	buf := make([]byte, 0, binary.MaxVarintLen64+4*len(vector)+len(payload))
-	buf = binary.AppendUvarint(buf, uint64(len(vector)))
-	for _, x := range vector {
-		buf = binary.LittleEndian.AppendUint32(buf, math.Float32bits(x))
-	}
-	return append(buf, payload...)
-}
-
-func decodeDoc(value []byte) (vector []float32, payload []byte, err error) {
-	dim, n := binary.Uvarint(value)
-	if n <= 0 || uint64(len(value)-n) < 4*dim {
-		return nil, nil, errors.New("corrupt document record")
-	}
-	vector = make([]float32, dim)
-	off := n
-	for i := range vector {
-		vector[i] = math.Float32frombits(binary.LittleEndian.Uint32(value[off:]))
-		off += 4
-	}
-	return vector, value[off:], nil
-}
-
 // New opens the engine in dataDir and rebuilds the vector index from it.
 func New(dataDir string, opts *storage.Options) (*Server, error) {
 	db, err := storage.Open(dataDir, opts)
@@ -85,11 +49,11 @@ func New(dataDir string, opts *storage.Options) (*Server, error) {
 
 	seq, errCheck := db.All()
 	for k, v := range seq {
-		if len(k) < len(docPrefix)+8 || string(k[:len(docPrefix)]) != string(docPrefix) {
+		id, isDoc := doc.IsDocKey(k)
+		if !isDoc {
 			continue
 		}
-		id := binary.BigEndian.Uint64(k[len(docPrefix):])
-		vec, _, err := decodeDoc(v)
+		vec, _, err := doc.Decode(v)
 		if err != nil {
 			db.Close()
 			return nil, fmt.Errorf("rebuilding index from doc %d: %w", id, err)
@@ -157,7 +121,7 @@ func (s *Server) UpsertDocument(ctx context.Context, req *pb.UpsertDocumentReque
 	}
 	// Engine first: if the index update then fails, a restart rebuilds the
 	// index from the engine and heals the inconsistency.
-	if err := s.db.Put(docKey(req.Id), encodeDoc(req.Vector, req.Payload)); err != nil {
+	if err := s.db.Put(doc.Key(req.Id), doc.Encode(req.Vector, req.Payload)); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if err := s.ix.Delete(req.Id); err != nil && !errors.Is(err, index.ErrNotFound) {
@@ -171,7 +135,7 @@ func (s *Server) UpsertDocument(ctx context.Context, req *pb.UpsertDocumentReque
 }
 
 func (s *Server) DeleteDocument(ctx context.Context, req *pb.DeleteDocumentRequest) (*pb.DeleteDocumentResponse, error) {
-	if err := s.db.Delete(docKey(req.Id)); err != nil {
+	if err := s.db.Delete(doc.Key(req.Id)); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if err := s.ix.Delete(req.Id); err != nil && !errors.Is(err, index.ErrNotFound) {
@@ -196,12 +160,12 @@ func (s *Server) SearchVectors(ctx context.Context, req *pb.SearchVectorsRequest
 	for _, r := range res {
 		hit := &pb.SearchHit{Id: r.ID, Score: r.Score}
 		if req.IncludePayloads {
-			v, ok, err := s.db.Get(docKey(r.ID))
+			v, ok, err := s.db.Get(doc.Key(r.ID))
 			if err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
 			if ok {
-				if _, payload, err := decodeDoc(v); err == nil {
+				if _, payload, err := doc.Decode(v); err == nil {
 					hit.Payload = payload
 				}
 			}
