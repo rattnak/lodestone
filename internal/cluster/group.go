@@ -75,8 +75,11 @@ type applyResult struct {
 const resultHistory = 4096
 
 // OpenGroup opens or creates the partition's state under dir. peers excludes
-// self. The returned group is inert until Tick/Step are driven.
-func OpenGroup(gid uint32, dir, selfID string, peers []string, gt GroupTransport) (*Group, error) {
+// self. When learner is true the node joins as a non-voter and waits to be
+// added by the group's leader (used by a node joining an existing cluster);
+// founders pass learner=false with the full founder set as peers. The
+// returned group is inert until Tick/Step are driven.
+func OpenGroup(gid uint32, dir, selfID string, peers []string, learner bool, gt GroupTransport) (*Group, error) {
 	g := &Group{
 		ID:      gid,
 		dir:     dir,
@@ -95,10 +98,18 @@ func OpenGroup(gid uint32, dir, selfID string, peers []string, gt GroupTransport
 	g.rn, err = raft.NewNode(raft.Config{
 		ID:      selfID,
 		Peers:   peers,
+		Learner: learner,
 		Store:   rs,
 		Trans:   groupTrans{gt, gid},
 		Apply:   g.applyEntry,
 		Restore: g.restoreSnapshot,
+		// A wide election window relative to the heartbeat (both in 20ms
+		// ticks via the node's ticker): ~600ms–1.2s elections vs 20ms
+		// heartbeats. The large margin keeps a node hosting many groups
+		// from triggering spurious elections when scheduling jitter delays
+		// a heartbeat.
+		ElectionTicks:  30,
+		HeartbeatTicks: 1,
 	})
 	if err != nil {
 		g.db.Close()
@@ -360,8 +371,8 @@ func (g *Group) MaybeCompact(threshold uint64) error {
 func (g *Group) Status() raft.Status { return g.rn.Status() }
 
 // DB and Index expose state for telemetry.
-func (g *Group) DB() *storage.DB      { return g.db }
-func (g *Group) Index() *index.Index  { return g.ix }
+func (g *Group) DB() *storage.DB     { return g.db }
+func (g *Group) Index() *index.Index { return g.ix }
 
 func (g *Group) Close() error {
 	return g.db.Close()

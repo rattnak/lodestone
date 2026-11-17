@@ -49,7 +49,7 @@ func openHarness(t *testing.T, base string, members []string) *groupHarness {
 				peers = append(peers, other)
 			}
 		}
-		g, err := OpenGroup(1, filepath.Join(base, id), id, peers, harnessTransport{h})
+		g, err := OpenGroup(1, filepath.Join(base, id), id, peers, false, harnessTransport{h})
 		if err != nil {
 			t.Fatal(err)
 		}
