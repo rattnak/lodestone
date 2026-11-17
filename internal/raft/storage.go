@@ -13,15 +13,18 @@ import (
 // HardState is everything Raft must find intact after a crash: losing a
 // term/vote allows double voting; losing log entries un-commits data.
 type HardState struct {
-	Term     uint64
-	VotedFor string
-	Log      []Entry
-	SnapData []byte
+	Term      uint64
+	VotedFor  string
+	Log       []Entry
+	SnapData  []byte
 	SnapIndex uint64
 	SnapTerm  uint64
-	// Peers is the membership from applied conf changes; nil means "never
-	// changed — use the bootstrap configuration".
-	Peers []string
+	// Configured reports whether a membership was ever persisted; when
+	// false, Peers/Voter are ignored and the node uses its bootstrap or
+	// learner defaults.
+	Configured bool
+	Peers      []string // other voting members
+	Voter      bool     // whether self is in the configuration
 }
 
 // Storage persists Raft hard state. Every method must be durable when it
@@ -34,8 +37,9 @@ type Storage interface {
 	Append(entries []Entry) error
 	// SetSnapshot stores the snapshot and discards log entries <= index.
 	SetSnapshot(data []byte, index, term uint64) error
-	// SetPeers records the membership after an applied conf change.
-	SetPeers(peers []string) error
+	// SetConfig records the membership after an applied conf change: the
+	// other voting members and whether self is a voter.
+	SetConfig(peers []string, voter bool) error
 }
 
 // MemoryStorage keeps hard state in memory. The simulator "crashes" nodes by
@@ -80,10 +84,12 @@ func (m *MemoryStorage) Append(entries []Entry) error {
 	return nil
 }
 
-func (m *MemoryStorage) SetPeers(peers []string) error {
+func (m *MemoryStorage) SetConfig(peers []string, voter bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.hs.Configured = true
 	m.hs.Peers = append([]string(nil), peers...)
+	m.hs.Voter = voter
 	return nil
 }
 
@@ -107,10 +113,10 @@ func (m *MemoryStorage) SetSnapshot(data []byte, index, term uint64) error {
 // The Raft log stored in a log — compaction happens when a snapshot record
 // supersedes everything before it, at which point the WAL is rewritten.
 type WALStorage struct {
-	mu   sync.Mutex
-	dir  string
-	wal  *storage.WAL
-	hs   HardState
+	mu  sync.Mutex
+	dir string
+	wal *storage.WAL
+	hs  HardState
 }
 
 // WAL record keys (values carry the payload):
@@ -119,7 +125,7 @@ const (
 	walKeyEntry    = "e" // value: index | term uvarints | type byte | data
 	walKeyTruncate = "t" // value: fromIndex uvarint — discard entries >= from
 	walKeySnap     = "p" // value: index | term uvarints | snapshot data
-	walKeyPeers    = "m" // value: count uvarint | (len uvarint | id)...
+	walKeyConfig   = "m" // value: voter byte | count uvarint | (len uvarint | id)...
 )
 
 func OpenWALStorage(dir string) (*WALStorage, error) {
@@ -159,8 +165,11 @@ func (w *WALStorage) replay(key string, val []byte) {
 	case walKeyTruncate:
 		from, _ := binary.Uvarint(val)
 		w.truncateFrom(from)
-	case walKeyPeers:
-		count, n := binary.Uvarint(val)
+	case walKeyConfig:
+		w.hs.Configured = true
+		w.hs.Voter = val[0] == 1
+		count, n := binary.Uvarint(val[1:])
+		n += 1
 		peers := make([]string, 0, count)
 		for i := uint64(0); i < count; i++ {
 			l, n2 := binary.Uvarint(val[n:])
@@ -272,8 +281,8 @@ func (w *WALStorage) SetSnapshot(data []byte, index, term uint64) error {
 	write(walKeySnap, append(snapVal, data...))
 	stateVal := binary.AppendUvarint(nil, w.hs.Term)
 	write(walKeyState, append(stateVal, w.hs.VotedFor...))
-	if w.hs.Peers != nil {
-		write(walKeyPeers, encodeWALPeers(w.hs.Peers))
+	if w.hs.Configured {
+		write(walKeyConfig, encodeWALConfig(w.hs.Peers, w.hs.Voter))
 	}
 	for _, e := range w.hs.Log {
 		write(walKeyEntry, encodeWALEntry(e))
@@ -304,8 +313,12 @@ func encodeWALEntry(e Entry) []byte {
 	return append(val, e.Data...)
 }
 
-func encodeWALPeers(peers []string) []byte {
-	val := binary.AppendUvarint(nil, uint64(len(peers)))
+func encodeWALConfig(peers []string, voter bool) []byte {
+	val := make([]byte, 1)
+	if voter {
+		val[0] = 1
+	}
+	val = binary.AppendUvarint(val, uint64(len(peers)))
 	for _, p := range peers {
 		val = binary.AppendUvarint(val, uint64(len(p)))
 		val = append(val, p...)
@@ -313,13 +326,15 @@ func encodeWALPeers(peers []string) []byte {
 	return val
 }
 
-func (w *WALStorage) SetPeers(peers []string) error {
+func (w *WALStorage) SetConfig(peers []string, voter bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.appendRecord(walKeyPeers, encodeWALPeers(peers)); err != nil {
+	if err := w.appendRecord(walKeyConfig, encodeWALConfig(peers, voter)); err != nil {
 		return err
 	}
+	w.hs.Configured = true
 	w.hs.Peers = append([]string(nil), peers...)
+	w.hs.Voter = voter
 	return nil
 }
 

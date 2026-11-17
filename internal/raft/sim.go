@@ -22,11 +22,13 @@ import (
 //   - regression: one node applies different content at an index it (or
 //     anyone) already applied — a lost committed entry
 type Cluster struct {
-	rng    *rand.Rand
-	ids    []string
-	nodes  map[string]*Node
-	stores map[string]*MemoryStorage
-	seeds  map[string]int64
+	rng          *rand.Rand
+	ids          []string
+	nodes        map[string]*Node
+	stores       map[string]*MemoryStorage
+	seeds        map[string]int64
+	founderPeers map[string][]string
+	learners     map[string]bool
 
 	now      uint64
 	seq      uint64
@@ -57,8 +59,8 @@ func (h msgHeap) Less(i, j int) bool {
 	}
 	return h[i].seq < h[j].seq
 }
-func (h msgHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *msgHeap) Push(x any)        { *h = append(*h, x.(scheduledMsg)) }
+func (h msgHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *msgHeap) Push(x any)   { *h = append(*h, x.(scheduledMsg)) }
 func (h *msgHeap) Pop() any {
 	old := *h
 	m := old[len(old)-1]
@@ -76,46 +78,54 @@ func (t clusterTransport) Send(m Message) { t.c.enqueue(m) }
 // message delay and no drops.
 func NewCluster(seed int64, n int) *Cluster {
 	c := &Cluster{
-		rng:        rand.New(rand.NewSource(seed)),
-		nodes:      map[string]*Node{},
-		stores:     map[string]*MemoryStorage{},
-		seeds:      map[string]int64{},
-		group:      map[string]int{},
-		applied:    map[string][]Entry{},
-		appliedIdx: map[string]uint64{},
-		committed:  map[uint64]Entry{},
-		maxDelay:   1,
+		rng:          rand.New(rand.NewSource(seed)),
+		nodes:        map[string]*Node{},
+		stores:       map[string]*MemoryStorage{},
+		seeds:        map[string]int64{},
+		founderPeers: map[string][]string{},
+		learners:     map[string]bool{},
+		group:        map[string]int{},
+		applied:      map[string][]Entry{},
+		appliedIdx:   map[string]uint64{},
+		committed:    map[uint64]Entry{},
+		maxDelay:     1,
 	}
 	for i := 1; i <= n; i++ {
 		c.ids = append(c.ids, fmt.Sprintf("n%d", i))
 	}
+	founders := append([]string(nil), c.ids...)
 	for _, id := range c.ids {
 		c.stores[id] = NewMemoryStorage()
 		c.seeds[id] = c.rng.Int63()
+		c.founderPeers[id] = without(founders, id)
 		c.start(id)
 	}
 	return c
 }
 
-func (c *Cluster) peersOf(id string) []string {
-	var ps []string
-	for _, other := range c.ids {
-		if other != id {
-			ps = append(ps, other)
+func without(ss []string, x string) []string {
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if s != x {
+			out = append(out, s)
 		}
 	}
-	return ps
+	return out
 }
 
-// start boots (or reboots) a node from its storage.
+// start boots (or reboots) a node from its storage. Founders carry their
+// founder peer set and vote; a node added later starts as a learner (nil
+// peers) until the leader commits a ConfChange adding it. On restart, either
+// way, a persisted configuration in storage overrides these defaults.
 func (c *Cluster) start(id string) {
 	cfg := Config{
-		ID:    id,
-		Peers: c.peersOf(id),
-		Store: c.stores[id],
-		Trans: clusterTransport{c},
-		Apply: func(e Entry) { c.recordApply(id, e) },
-		Restore: func(data []byte) { c.restoreApply(id, data) },
+		ID:             id,
+		Peers:          c.founderPeers[id],
+		Learner:        c.learners[id],
+		Store:          c.stores[id],
+		Trans:          clusterTransport{c},
+		Apply:          func(e Entry) { c.recordApply(id, e) },
+		Restore:        func(data []byte) { c.restoreApply(id, data) },
 		ElectionTicks:  10,
 		HeartbeatTicks: 1,
 		Rand:           rand.New(rand.NewSource(c.seeds[id] ^ int64(c.now))),
@@ -136,13 +146,14 @@ func (c *Cluster) start(id string) {
 // Crash removes the node (RAM lost), keeping its storage (disk intact).
 func (c *Cluster) Crash(id string) { delete(c.nodes, id) }
 
-// AddNode boots a brand-new node (empty storage) that bootstraps against the
-// current members. The caller must still commit the membership change via
-// ProposeConfChange on the leader for voting rights.
+// AddNode boots a brand-new learner node (empty storage, no vote). The caller
+// commits a ConfChange on the leader to add it to the membership, at which
+// point it becomes a voter.
 func (c *Cluster) AddNode(id string) {
 	c.ids = append(c.ids, id)
 	c.stores[id] = NewMemoryStorage()
 	c.seeds[id] = c.rng.Int63()
+	c.learners[id] = true
 	c.start(id)
 }
 

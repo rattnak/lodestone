@@ -23,7 +23,7 @@ func TestAddNode(t *testing.T) {
 	proposeN(t, c, "before", 5)
 
 	c.AddNode("n4")
-	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Add: true, NodeID: "n4"}); !ok {
+	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Members: addTo(c.Node(leader).Members(), "n4")}); !ok {
 		t.Fatal("conf change rejected")
 	}
 	c.RunTicks(100)
@@ -59,7 +59,7 @@ func TestAddNodeCatchesUpViaSnapshot(t *testing.T) {
 	}
 	leader := c.Leader()
 	c.AddNode("n4")
-	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Add: true, NodeID: "n4"}); !ok {
+	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Members: addTo(c.Node(leader).Members(), "n4")}); !ok {
 		t.Fatal("conf change rejected")
 	}
 	c.RunTicks(150)
@@ -84,7 +84,7 @@ func TestRemoveNode(t *testing.T) {
 			break
 		}
 	}
-	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Add: false, NodeID: victim}); !ok {
+	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Members: without(c.Node(leader).Members(), victim)}); !ok {
 		t.Fatal("conf change rejected")
 	}
 	c.RunTicks(60)
@@ -112,10 +112,12 @@ func TestOneConfChangeAtATime(t *testing.T) {
 		}
 	}
 	c.Partition([]string{leader}, others)
-	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Add: true, NodeID: "n4"}); !ok {
+	c.AddNode("n4")
+	c.AddNode("n5")
+	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Members: addTo(c.Node(leader).Members(), "n4")}); !ok {
 		t.Fatal("first conf change rejected")
 	}
-	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Add: true, NodeID: "n5"}); ok {
+	if _, ok := c.Node(leader).ProposeConfChange(ConfChange{Members: addTo(c.Node(leader).Members(), "n5")}); ok {
 		t.Fatal("second conf change accepted while first uncommitted — quorums can stop overlapping")
 	}
 }
@@ -126,12 +128,12 @@ func TestWALStoragePersistsTypeAndPeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cc, _ := EncodeConfChange(ConfChange{Add: true, NodeID: "n9"})
+	cc, _ := EncodeConfChange(ConfChange{Members: []string{"n1", "n2", "n9"}})
 	ws.Append([]Entry{
 		{Index: 1, Term: 1, Type: EntryNormal, Data: []byte("cmd")},
 		{Index: 2, Term: 1, Type: EntryConfChange, Data: cc},
 	})
-	ws.SetPeers([]string{"n2", "n9"})
+	ws.SetConfig([]string{"n2", "n9"}, true)
 	ws.Close()
 
 	ws, err = OpenWALStorage(dir)
@@ -144,10 +146,14 @@ func TestWALStoragePersistsTypeAndPeers(t *testing.T) {
 		t.Fatalf("entry types lost: %+v", hs.Log)
 	}
 	got, err := DecodeConfChange(hs.Log[1].Data)
-	if err != nil || !got.Add || got.NodeID != "n9" {
+	if err != nil || !slices.Equal(got.Members, []string{"n1", "n2", "n9"}) {
 		t.Fatalf("conf change payload = %+v, %v", got, err)
 	}
-	if !slices.Equal(hs.Peers, []string{"n2", "n9"}) {
-		t.Fatalf("peers = %v", hs.Peers)
+	if !slices.Equal(hs.Peers, []string{"n2", "n9"}) || !hs.Voter || !hs.Configured {
+		t.Fatalf("config = peers %v voter %v configured %v", hs.Peers, hs.Voter, hs.Configured)
 	}
+}
+
+func addTo(set []string, x string) []string {
+	return append(append([]string(nil), set...), x)
 }
