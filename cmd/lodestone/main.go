@@ -12,12 +12,16 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/rattnak/lodestone/internal/client"
 	"github.com/rattnak/lodestone/internal/embed"
 	"github.com/rattnak/lodestone/internal/index"
+	"github.com/rattnak/lodestone/internal/ingest"
+	"github.com/rattnak/lodestone/internal/lodelog"
 	"github.com/rattnak/lodestone/internal/server"
 )
 
@@ -37,6 +41,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "ingest":
+		if err := runIngest(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -46,14 +55,79 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   lodestone serve  -data <dir> [-addr :7437]
+  lodestone ingest -data <dir> -server <host:port> [-sources wikipedia,hackernews]
   lodestone search -file <texts.txt> -query "..." [-k 5] [-ollama URL] [-model NAME]
 
 serve runs a lodestone node: KV + vector search over gRPC.
 
-search is a self-contained demo: embeds each line of the file, indexes the
-vectors in HNSW, then answers the query semantically. Requires a running
-Ollama with an embedding model:
-  ollama pull nomic-embed-text`)
+ingest streams live events (Wikipedia edits, Hacker News stories) into a local
+lodelog, embeds them via Ollama, and upserts documents into the cluster at
+-server. Requires a running Ollama with an embedding model:
+  ollama pull nomic-embed-text
+
+search is a self-contained demo over a local text file.`)
+}
+
+func runIngest(args []string) error {
+	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
+	data := fs.String("data", "", "directory for the lodelog")
+	server := fs.String("server", "localhost:7437", "lodestone server to upsert into")
+	sources := fs.String("sources", "wikipedia,hackernews", "comma-separated: wikipedia,hackernews")
+	parts := fs.Int("partitions", 8, "lodelog partition count")
+	ollamaURL := fs.String("ollama", embed.DefaultBaseURL, "Ollama base URL")
+	model := fs.String("model", embed.DefaultModel, "embedding model")
+	fs.Parse(args)
+	if *data == "" {
+		return fmt.Errorf("-data is required")
+	}
+
+	lg, err := lodelog.Open(filepath.Join(*data, "lodelog"), *parts)
+	if err != nil {
+		return err
+	}
+	defer lg.Close()
+
+	cl, err := client.Dial(*server)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Source connectors publish into the log.
+	pub := ingest.NewPublisher(lg)
+	var srcs []ingest.Source
+	for _, s := range strings.Split(*sources, ",") {
+		switch strings.TrimSpace(s) {
+		case "wikipedia":
+			srcs = append(srcs, &ingest.WikipediaSource{})
+		case "hackernews":
+			srcs = append(srcs, &ingest.HackerNewsSource{})
+		}
+	}
+	for _, src := range srcs {
+		src := src
+		go func() {
+			fmt.Fprintf(os.Stderr, "source %s started\n", src.Name())
+			if err := src.Run(ctx, pub.Publish); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "source %s stopped: %v\n", src.Name(), err)
+			}
+		}()
+	}
+
+	// The embedder consumes the log and writes to the cluster.
+	emb, err := ingest.NewEmbedder(ingest.Config{
+		Log:      lg,
+		Embedder: embed.NewClient(*ollamaURL, *model),
+		Writer:   cl,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "ingesting into %s via %s...\n", *server, *model)
+	return emb.Run(ctx)
 }
 
 func runServe(args []string) error {
