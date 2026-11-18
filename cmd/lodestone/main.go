@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/rattnak/lodestone/internal/client"
+	"github.com/rattnak/lodestone/internal/cluster"
 	"github.com/rattnak/lodestone/internal/embed"
+	"github.com/rattnak/lodestone/internal/gateway"
 	"github.com/rattnak/lodestone/internal/index"
 	"github.com/rattnak/lodestone/internal/ingest"
 	"github.com/rattnak/lodestone/internal/lodelog"
@@ -46,6 +48,16 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "cluster":
+		if err := runCluster(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	case "dashboard":
+		if err := runDashboard(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -54,11 +66,19 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  lodestone serve  -data <dir> [-addr :7437]
-  lodestone ingest -data <dir> -server <host:port> [-sources wikipedia,hackernews]
-  lodestone search -file <texts.txt> -query "..." [-k 5] [-ollama URL] [-model NAME]
+  lodestone serve     -data <dir> [-addr :7437]
+  lodestone cluster   -data <dir> -addr <host:port> [-bootstrap | -seeds <addrs>]
+  lodestone dashboard -server <host:port> [-addr :8437]
+  lodestone ingest    -data <dir> -server <host:port> [-sources wikipedia,hackernews]
+  lodestone search    -file <texts.txt> -query "..." [-k 5] [-ollama URL] [-model NAME]
 
-serve runs a lodestone node: KV + vector search over gRPC.
+serve runs a single lodestone node: KV + vector search over gRPC.
+
+cluster runs a distributed node: partitioned, Raft-replicated. Start the first
+node with -bootstrap, then add more with -seeds pointing at a running node.
+
+dashboard serves the live web console (telemetry + search) over HTTP, bridging
+the node's gRPC API to the browser. Open http://localhost:8437.
 
 ingest streams live events (Wikipedia edits, Hacker News stories) into a local
 lodelog, embeds them via Ollama, and upserts documents into the cluster at
@@ -66,6 +86,84 @@ lodelog, embeds them via Ollama, and upserts documents into the cluster at
   ollama pull nomic-embed-text
 
 search is a self-contained demo over a local text file.`)
+}
+
+func runCluster(args []string) error {
+	fs := flag.NewFlagSet("cluster", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:7437", "this node's reachable address")
+	data := fs.String("data", "", "data directory")
+	seeds := fs.String("seeds", "", "comma-separated seed node addresses to join")
+	partitions := fs.Int("partitions", 8, "partition count (bootstrap only)")
+	rf := fs.Int("rf", 3, "replication factor")
+	bootstrap := fs.Bool("bootstrap", false, "form a new cluster as a founding node")
+	fs.Parse(args)
+	if *data == "" {
+		return fmt.Errorf("-data is required")
+	}
+
+	var seedList []string
+	for _, s := range strings.Split(*seeds, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			seedList = append(seedList, s)
+		}
+	}
+	node, err := cluster.NewNode(cluster.Options{
+		ID: *addr, Dir: *data, Seeds: seedList,
+		Partitions: uint32(*partitions), RF: *rf, Bootstrap: *bootstrap,
+	})
+	if err != nil {
+		return err
+	}
+	srv := cluster.NewClusterServer(node)
+	lis, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if len(seedList) > 0 && !*bootstrap {
+		jctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		srv.JoinSeeds(jctx, seedList)
+		cancel()
+	}
+	go func() {
+		<-ctx.Done()
+		fmt.Fprintln(os.Stderr, "shutting down...")
+		srv.Stop()
+	}()
+	fmt.Fprintf(os.Stderr, "lodestone cluster node %s (%d partitions, rf %d), data in %s\n", *addr, *partitions, *rf, *data)
+	return srv.Serve(lis)
+}
+
+func runDashboard(args []string) error {
+	fs := flag.NewFlagSet("dashboard", flag.ExitOnError)
+	addr := fs.String("addr", ":8437", "HTTP listen address")
+	server := fs.String("server", "localhost:7437", "lodestone server to bridge")
+	ollamaURL := fs.String("ollama", embed.DefaultBaseURL, "Ollama base URL (for text search)")
+	model := fs.String("model", embed.DefaultModel, "embedding model")
+	noEmbed := fs.Bool("no-embed", false, "disable text search (vector-only)")
+	fs.Parse(args)
+
+	cl, err := client.Dial(*server)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	var embedder embed.Embedder
+	if !*noEmbed {
+		embedder = embed.NewClient(*ollamaURL, *model)
+	}
+	gw := gateway.New(cl, embedder)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	shown := *addr
+	if strings.HasPrefix(shown, ":") {
+		shown = "localhost" + shown
+	}
+	fmt.Fprintf(os.Stderr, "dashboard on http://%s → %s\n", shown, *server)
+	return gw.Serve(ctx, *addr)
 }
 
 func runIngest(args []string) error {

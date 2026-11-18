@@ -13,8 +13,9 @@ import (
 )
 
 type Client struct {
-	conn *grpc.ClientConn
-	rpc  pb.LodestoneClient
+	conn  *grpc.ClientConn
+	rpc   pb.LodestoneClient
+	admin pb.ClusterAdminClient
 }
 
 // Dial connects to a lodestone server at addr (host:port).
@@ -23,12 +24,12 @@ func Dial(addr string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{conn: conn, rpc: pb.NewLodestoneClient(conn)}, nil
+	return FromConn(conn), nil
 }
 
 // FromConn wraps an existing connection (tests use this with bufconn).
 func FromConn(conn *grpc.ClientConn) *Client {
-	return &Client{conn: conn, rpc: pb.NewLodestoneClient(conn)}
+	return &Client{conn: conn, rpc: pb.NewLodestoneClient(conn), admin: pb.NewClusterAdminClient(conn)}
 }
 
 func (c *Client) Close() error { return c.conn.Close() }
@@ -85,6 +86,43 @@ func (c *Client) SearchVectors(ctx context.Context, vector []float32, k, ef int,
 		hits[i] = Hit{ID: h.Id, Score: h.Score, Payload: h.Payload}
 	}
 	return hits, nil
+}
+
+// GroupInfo describes one partition's Raft group, from a cluster node.
+type GroupInfo struct {
+	ID          uint32
+	State       string
+	Leader      string
+	Term        uint64
+	LastApplied uint64
+	Members     []string
+	Vectors     uint64
+}
+
+// Topology is a cluster node's view of the cluster: members, partition count,
+// and the groups this node hosts.
+type Topology struct {
+	Nodes      []string
+	Partitions uint32
+	Groups     []GroupInfo
+}
+
+// Describe returns the cluster topology from a cluster node. Single-node
+// servers don't register ClusterAdmin, so this returns an error there — the
+// caller treats that as "standalone node, no topology".
+func (c *Client) Describe(ctx context.Context) (*Topology, error) {
+	resp, err := c.admin.Describe(ctx, &pb.DescribeRequest{})
+	if err != nil {
+		return nil, err
+	}
+	t := &Topology{Nodes: resp.Nodes, Partitions: resp.Partitions}
+	for _, g := range resp.Groups {
+		t.Groups = append(t.Groups, GroupInfo{
+			ID: g.Id, State: g.State, Leader: g.Leader, Term: g.Term,
+			LastApplied: g.LastApplied, Members: g.Members, Vectors: g.Vectors,
+		})
+	}
+	return t, nil
 }
 
 // Telemetry is one snapshot of server state.
