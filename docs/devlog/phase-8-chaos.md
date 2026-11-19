@@ -28,6 +28,21 @@ retrying the *same* value until it definitively succeeds and timestamping the
 operation from its first attempt — so the recorded window covers any secret
 commit, and the history stays faithful.
 
+## The bug it found
+
+The test earned its keep immediately: it flagged a stale-read bug on the first
+serious run. The leader reads had been using a lease based on the logical
+clock, and a lease is unsafe under a process pause — a paused leader's clock
+freezes, so on resume it can still think its lease is valid and serve a stale
+read before it learns a new leader was elected. The fix is the ReadIndex
+protocol with *active* confirmation: a read takes a barrier and then waits for
+a quorum to acknowledge the leader *after* it, so a resumed ex-leader fails
+confirmation and refuses the read. (This is exactly why etcd defaults to
+ReadIndex over lease reads.) Getting there also meant fixing the harness: an
+indeterminate write must be modeled as a *pending* operation porcupine can
+place anywhere or nowhere, not as a completed one — otherwise the checker
+reports false violations of its own.
+
 ## Making sure the check isn't vacuous
 
 A linearizability test that always passes could mean "the system is correct" or
