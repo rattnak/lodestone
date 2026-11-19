@@ -7,3 +7,4 @@ One write-up per phase: what was built, what the book said, what broke, and what
 - [Phases 3–5 — Distributed cluster](phase-3-5-distributed.md)
 - [Phase 6 — Streaming ingestion](phase-6-streaming.md)
 - [Phase 7 — The live console](phase-7-console.md)
+- [Phase 8 — Chaos & hardening](phase-8-chaos.md)
