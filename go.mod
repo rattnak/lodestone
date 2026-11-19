@@ -3,6 +3,7 @@ module github.com/rattnak/lodestone
 go 1.26.1
 
 require (
+	github.com/anishathalye/porcupine v1.3.1
 	go.etcd.io/bbolt v1.5.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
