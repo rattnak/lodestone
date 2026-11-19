@@ -251,20 +251,32 @@ func (g *Group) Propose(ctx context.Context, cmd Command) error {
 	}
 }
 
-// LinearizableRead waits until this node may serve a read with no staleness:
-// it must be the leader holding a lease, and the state machine must have
-// applied everything committed as of the lease check. Note the wait is on
-// the group's own applied counter, not Raft's — Raft counts an entry applied
-// when queued, but the read needs the engine write to have happened.
+// LinearizableRead returns once this node may serve a read with no staleness.
+// It uses the ReadIndex protocol: take a barrier and read index, wait for a
+// quorum to confirm this node is still leader after the barrier (active
+// confirmation — safe even if this node was just paused), then wait until the
+// state machine has applied through the read index. The wait is on the
+// group's own applied counter, not Raft's: Raft counts an entry applied when
+// it's queued for delivery, but the read needs the engine write to have
+// actually happened.
 func (g *Group) LinearizableRead(ctx context.Context) error {
-	readIndex, ok := g.rn.ReadIndex()
+	barrier, readIndex, ok := g.rn.ReadBarrier()
 	if !ok {
 		return ErrNotLeader{LeaderID: g.rn.Status().LeaderID}
 	}
-	for {
-		if g.appliedIdx.Load() >= readIndex {
-			return nil
+	// Wait for a fresh quorum confirmation of leadership.
+	for !g.rn.ReadConfirmed(barrier) {
+		if g.rn.Status().State != raft.Leader {
+			return ErrNotLeader{LeaderID: g.rn.Status().LeaderID}
 		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	// Wait for the state machine to have applied through the read index.
+	for g.appliedIdx.Load() < readIndex {
 		g.mu.Lock()
 		ch := g.applied
 		g.mu.Unlock()
@@ -275,6 +287,7 @@ func (g *Group) LinearizableRead(ctx context.Context) error {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+	return nil
 }
 
 // Get serves a linearizable read of key.

@@ -265,36 +265,46 @@ func TestSnapshotCatchesUpLaggingFollower(t *testing.T) {
 	noViolations(t, c)
 }
 
-func TestLeaseRead(t *testing.T) {
+func TestReadIndexConfirmation(t *testing.T) {
 	c := NewCluster(7, 3)
 	leader := c.WaitLeader(200)
 	c.Propose([]byte("x=1"))
 	c.RunTicks(20)
 
-	if _, ok := c.Node(leader).ReadIndex(); !ok {
-		t.Fatal("healthy leader has no read lease")
+	// A healthy leader can start a read, and after a heartbeat round a quorum
+	// confirms it.
+	barrier, _, ok := c.Node(leader).ReadBarrier()
+	if !ok {
+		t.Fatal("healthy leader cannot start a read")
 	}
-	// A follower must refuse lease reads outright.
+	c.RunTicks(5) // let the heartbeat and acks flow
+	if !c.Node(leader).ReadConfirmed(barrier) {
+		t.Fatal("healthy leader never got a quorum read confirmation")
+	}
+	// A follower cannot start a read at all.
 	for _, id := range c.LiveIDs() {
 		if id != leader {
-			if _, ok := c.Node(id).ReadIndex(); ok {
-				t.Fatalf("follower %s granted a lease read — that's the stale-read bug", id)
+			if _, _, ok := c.Node(id).ReadBarrier(); ok {
+				t.Fatalf("follower %s started a read — that's the stale-read bug", id)
 			}
 		}
 	}
-	// Isolate the leader: once a full election timeout passes without
-	// quorum contact, its lease must lapse, because the other side may
-	// have elected a new leader and accepted writes.
+	// Isolate the leader: it must never get confirmation (no quorum contact),
+	// and once CheckQuorum fires it steps down and can't even start a read.
 	var others []string
 	for _, id := range c.LiveIDs() {
 		if id != leader {
 			others = append(others, id)
 		}
 	}
+	barrier2, _, started := c.Node(leader).ReadBarrier()
 	c.Partition([]string{leader}, others)
 	c.RunTicks(30)
-	if _, ok := c.Node(leader).ReadIndex(); ok {
-		t.Fatal("isolated leader still claims a read lease")
+	if started && c.Node(leader).ReadConfirmed(barrier2) {
+		t.Fatal("isolated leader got a read confirmation — stale read possible")
+	}
+	if _, _, ok := c.Node(leader).ReadBarrier(); ok {
+		t.Fatal("isolated leader still starts reads after stepping down")
 	}
 	noViolations(t, c)
 }

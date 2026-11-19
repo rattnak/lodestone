@@ -1099,26 +1099,57 @@ func (n *Node) quorumActive() bool {
 	return count >= n.quorum()
 }
 
-// ReadIndex returns the commit index a linearizable read may be served at and
-// whether this node may serve it now. A read is safe when this node is the
-// leader and has committed an entry in its current term (so commitIndex
-// reflects every prior write): CheckQuorum (see Tick) makes a leader that has
-// lost quorum contact step down within an election timeout, before any other
-// node could win, so a stale leader stops serving reads in time.
+// Linearizable reads use the ReadIndex protocol with *active* confirmation,
+// not a passive lease. A lease based on the logical clock is unsafe under a
+// process pause: a paused leader's clock freezes, so on resume it can still
+// believe its lease is valid and serve a stale read before learning a new
+// leader exists. Instead, a read:
 //
-// Serving the moment leadership is established — rather than gating each read
-// on a fresh quorum round — is what keeps reads available on a busy leader
-// whose heartbeat acks arrive unevenly.
-func (n *Node) ReadIndex() (uint64, bool) {
+//  1. takes a barrier (the current tick) and the read index (commit index,
+//     which must include a committed current-term entry so it reflects every
+//     earlier write), then
+//  2. waits until a quorum has acknowledged this leader *after* the barrier —
+//     fresh contact proving it is still the leader right now.
+//
+// A paused-then-resumed node that is no longer leader gets higher-term
+// rejections when it broadcasts and steps down, so confirmation fails and the
+// read is refused rather than served stale.
+
+// ReadBarrier begins a linearizable read. It returns the tick barrier and the
+// read index, or ok=false if this node cannot start a read (not leader, or no
+// committed current-term entry yet).
+func (n *Node) ReadBarrier() (barrier, readIndex uint64, ok bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.state != Leader {
-		return 0, false
+		return 0, 0, false
 	}
-	// Require a committed current-term entry. becomeLeader appends a no-op,
-	// so this holds as soon as that no-op commits.
 	if t, ok := n.termAt(n.commitIndex); !ok || t != n.term {
-		return 0, false
+		return 0, 0, false
 	}
-	return n.commitIndex, true
+	// Prompt a heartbeat so confirmation arrives quickly rather than waiting
+	// for the next scheduled beat.
+	n.broadcastAppend()
+	return n.tickCount, n.commitIndex, true
+}
+
+// ReadConfirmed reports whether this node is still the leader and a quorum has
+// acknowledged it strictly after barrier — fresh enough to prove no other
+// leader has superseded it.
+func (n *Node) ReadConfirmed(barrier uint64) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state != Leader {
+		return false
+	}
+	if len(n.peers) == 0 {
+		return true
+	}
+	count := 1 // self
+	for _, p := range n.peers {
+		if n.lastAck[p] > barrier {
+			count++
+		}
+	}
+	return count >= n.quorum()
 }

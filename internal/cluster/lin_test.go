@@ -2,7 +2,9 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"path/filepath"
 	"sync"
@@ -32,8 +34,8 @@ type linHarness struct {
 
 	mu     sync.RWMutex
 	groups map[string]*Group
-	paused map[string]bool  // "crashed": not ticked, mail dropped
-	part   map[string]int   // partition group id per node; equal => connected
+	paused map[string]bool // "crashed": not ticked, mail dropped
+	part   map[string]int  // partition group id per node; equal => connected
 
 	stop chan struct{}
 	wg   sync.WaitGroup
@@ -148,36 +150,50 @@ func (h *linHarness) liveGroups() []*Group {
 	return gs
 }
 
-// put proposes key=value through whichever live node is the leader, retrying
-// the same value until it commits or the deadline passes. Retrying the same
-// value keeps the recorded operation linearizable even if an earlier attempt
-// secretly committed.
-func (h *linHarness) put(ctx context.Context, key, value string) bool {
-	for ctx.Err() == nil {
+// put proposes key=value and reports the outcome as one of three states:
+//
+//	committed       — Propose returned nil; the value is durably committed.
+//	maybe           — a leader appended the value then lost leadership or
+//	                  timed out; it may or may not commit (recorded as a
+//	                  pending operation).
+//	neither         — only ever ErrNotLeader (the value was never appended);
+//	                  it definitely did not commit, so it isn't recorded.
+//
+// A value is only ever *appended* once, so it commits at most once — which is
+// what lets porcupine model it as a single operation.
+func (h *linHarness) put(ctx context.Context, key, value string, deadline time.Time) (committed, maybe bool) {
+	for ctx.Err() == nil && time.Now().Before(deadline) {
 		for _, g := range h.liveGroups() {
 			if g.Status().State != raft.Leader {
 				continue
 			}
-			cctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			cctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
 			err := g.Propose(cctx, Command{Op: OpPut, Key: []byte(key), Value: []byte(value)})
 			cancel()
 			if err == nil {
-				return true
+				return true, false // committed exactly once
 			}
+			var nl ErrNotLeader
+			if errors.As(err, &nl) {
+				continue // not appended here; safe to try another node
+			}
+			return false, true // appended but uncertain — pending
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
-	return false
+	return false, false // never appended — definitely did not commit
 }
 
-// get performs a linearizable read via the leader, retrying until one serves.
-func (h *linHarness) get(ctx context.Context, key string) (string, bool) {
-	for ctx.Err() == nil {
+// get performs a linearizable read via the leader, retrying until one serves
+// or the deadline passes. Reads don't mutate state, so retrying is safe and
+// the observed value is valid anywhere in the [first attempt, success] window.
+func (h *linHarness) get(ctx context.Context, key string, deadline time.Time) (string, bool) {
+	for ctx.Err() == nil && time.Now().Before(deadline) {
 		for _, g := range h.liveGroups() {
 			if g.Status().State != raft.Leader {
 				continue
 			}
-			cctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			cctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
 			v, _, err := g.Get(cctx, []byte(key))
 			cancel()
 			if err == nil {
@@ -256,11 +272,21 @@ func TestLinearizableUnderFaults(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
+	// Record a linearizability history as porcupine operations with real
+	// call/return timestamps. An indeterminate write (one that may or may not
+	// have committed) is recorded as pending — Return = maxTime — which
+	// porcupine places anywhere after its call, or not at all. That is the
+	// honest model for a write whose outcome a client never learned.
+	const pending = int64(math.MaxInt64)
 	var ops []porcupine.Operation
 	var opsMu sync.Mutex
-	var seq atomic.Int64
 	start := time.Now()
-	now := func() int64 { return int64(time.Since(start)) }
+	nowT := func() int64 { return int64(time.Since(start)) }
+	record := func(client int, in kvInput, out string, call, ret int64) {
+		opsMu.Lock()
+		ops = append(ops, porcupine.Operation{ClientId: client, Input: in, Output: out, Call: call, Return: ret})
+		opsMu.Unlock()
+	}
 
 	// Fault injector: alternately isolate the current leader (minority side)
 	// and heal, forcing repeated leader changes while a quorum survives.
@@ -299,7 +325,9 @@ func TestLinearizableUnderFaults(t *testing.T) {
 		}
 	}()
 
-	// Concurrent clients issuing puts and gets against a small key set.
+	// Concurrent clients issuing puts (unique values) and gets.
+	perOp := func() time.Time { return time.Now().Add(3 * time.Second) }
+	var completed atomic.Int64
 	var clientsWG sync.WaitGroup
 	for c := 0; c < clients; c++ {
 		clientsWG.Add(1)
@@ -312,17 +340,23 @@ func TestLinearizableUnderFaults(t *testing.T) {
 				if rng.Intn(2) == 0 {
 					val := fmt.Sprintf("c%d-%d", cid, n)
 					n++
-					call := now()
-					if h.put(ctx, key, val) {
-						record(&opsMu, &ops, cid, kvInput{"put", key, val}, "", call, now())
+					callT := nowT()
+					committed, maybe := h.put(ctx, key, val, perOp())
+					switch {
+					case committed:
+						record(cid, kvInput{"put", key, val}, "", callT, nowT())
+						completed.Add(1)
+					case maybe:
+						record(cid, kvInput{"put", key, val}, "", callT, pending)
 					}
+					// neither: never appended — not recorded
 				} else {
-					call := now()
-					if v, ok := h.get(ctx, key); ok {
-						record(&opsMu, &ops, cid, kvInput{"get", key, ""}, v, call, now())
+					callT := nowT()
+					if v, ok := h.get(ctx, key, perOp()); ok {
+						record(cid, kvInput{"get", key, ""}, v, callT, nowT())
+						completed.Add(1)
 					}
 				}
-				_ = seq.Add(1)
 			}
 		}(c)
 	}
@@ -331,17 +365,17 @@ func TestLinearizableUnderFaults(t *testing.T) {
 	cancel()
 	fault.Wait()
 
-	if len(ops) < 20 {
-		t.Fatalf("only %d operations completed — the workload barely ran", len(ops))
+	if completed.Load() < 20 {
+		t.Fatalf("only %d operations completed — the workload barely ran", completed.Load())
 	}
-	res, info := porcupine.CheckOperationsVerbose(kvModel, ops, 10*time.Second)
+	res, info := porcupine.CheckOperationsVerbose(kvModel, ops, 20*time.Second)
 	switch res {
 	case porcupine.Ok:
-		t.Logf("linearizable: %d operations across faults verified", len(ops))
+		t.Logf("linearizable: %d operations (%d completed) across faults verified", len(ops), completed.Load())
 	case porcupine.Illegal:
 		t.Fatalf("LINEARIZABILITY VIOLATION over %d operations: %+v", len(ops), info)
 	case porcupine.Unknown:
-		t.Fatalf("porcupine timed out checking %d operations", len(ops))
+		t.Fatalf("porcupine timed out checking the history")
 	}
 }
 
@@ -368,10 +402,4 @@ func TestLinearizabilityCheckerCatchesViolation(t *testing.T) {
 	if !porcupine.CheckOperations(kvModel, ops) {
 		t.Fatal("checker rejected a valid history")
 	}
-}
-
-func record(mu *sync.Mutex, ops *[]porcupine.Operation, client int, in kvInput, out string, call, ret int64) {
-	mu.Lock()
-	*ops = append(*ops, porcupine.Operation{ClientId: client, Input: in, Output: out, Call: call, Return: ret})
-	mu.Unlock()
 }
