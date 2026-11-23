@@ -30,13 +30,27 @@ sequentially.
 
 | Operation | Time | Note |
 |---|---|---|
-| HNSW search (k=10, ef=64) | **454 µs** | approximate; recall ≥ 0.98 vs brute force |
+| HNSW search (k=10, ef=64) | **316 µs** | approximate; recall ≥ 0.98 vs brute force |
 | Brute-force search | 1.55 ms | exact, O(n) |
-| HNSW insert | 806 µs | graph construction cost |
+| HNSW insert | 448 µs | graph construction cost |
 
-The 3.4× speedup understates it: brute force is O(n) and HNSW is ~O(log n), so
-the gap grows by an order of magnitude for every 10× more vectors. Recall is
-measured in `TestRecallAgainstBruteForce` (0.98 L2 / 0.997 cosine at ef=64).
+The ~5× search speedup understates it: brute force is O(n) and HNSW is
+~O(log n), so the gap grows by an order of magnitude for every 10× more
+vectors. Recall is measured in `TestRecallAgainstBruteForce` (0.98 L2 / 0.997
+cosine at ef=64), unchanged by the tuning below.
+
+**Allocation tuning.** Replacing the per-query `map[int32]bool` visited set
+with a pooled, generation-stamped buffer (the standard HNSW trick — clearing
+is a single generation bump, not a reallocation) cut the work measurably:
+
+| | before | after |
+|---|---|---|
+| search | 384 µs · 52.8 KB/op | **316 µs · 13.0 KB/op** |
+| insert | 642 µs · 108 KB/op | **448 µs · 65 KB/op** |
+
+Insert gains most because it searches the graph repeatedly during
+construction. Profile the remaining allocations with the commands below — the
+candidate heaps are the next target.
 
 ## Log broker — lodelog
 
@@ -67,6 +81,7 @@ go test ./internal/storage/ -bench BenchmarkLodestonePut/sync=false \
 go tool pprof -alloc_objects -http=:0 mem.out
 ```
 
-Known hot spots worth a look (noted for future tuning): the HNSW search
-allocates a visited-set map per query (the first thing to pool), and the
-storage read path builds a fresh bufio reader per SSTable lookup.
+Known hot spots worth a look (noted for future tuning): the HNSW candidate
+heaps still allocate their backing arrays per search (pooling them is the next
+step after the visited-set win above), and the storage read path builds a
+fresh bufio reader per SSTable lookup.

@@ -267,11 +267,16 @@ func (ix *Index) greedyClosest(query []float32, start int32, l int) int32 {
 // keeping the ef closest points seen. Returns candidates sorted closest
 // first.
 func (ix *Index) searchLayer(query []float32, eps []candidate, ef, l int) []candidate {
-	visited := map[int32]bool{}
-	frontier := &minHeap{}  // to explore, closest first
-	best := &maxHeap{}      // ef best so far, farthest on top
+	vis := getVisited(len(ix.nodes)) // pooled, generation-stamped (no per-query map alloc)
+	defer putVisited(vis)
+	// Pre-size the heaps to the result width so they rarely regrow: best is
+	// capped at ef, and the frontier is usually the same order of magnitude.
+	fh := make(minHeap, 0, ef)
+	bh := make(maxHeap, 0, ef)
+	frontier := &fh // to explore, closest first
+	best := &bh     // ef best so far, farthest on top
 	for _, c := range eps {
-		visited[c.idx] = true
+		vis.mark(c.idx)
 		heap.Push(frontier, c)
 		heap.Push(best, c)
 	}
@@ -281,10 +286,10 @@ func (ix *Index) searchLayer(query []float32, eps []candidate, ef, l int) []cand
 			break // everything reachable is farther than the worst keeper
 		}
 		for _, nb := range ix.linksAt(c.idx, l) {
-			if visited[nb] {
+			if vis.seen(nb) {
 				continue
 			}
-			visited[nb] = true
+			vis.mark(nb)
 			d := ix.opts.Distance(query, ix.nodes[nb].vec)
 			if best.Len() < ef || d < (*best)[0].dist {
 				heap.Push(frontier, candidate{idx: nb, dist: d})
@@ -301,6 +306,41 @@ func (ix *Index) searchLayer(query []float32, eps []candidate, ef, l int) []cand
 	}
 	return out
 }
+
+// visited is a generation-stamped membership set over node indices. Clearing
+// it is a single generation bump rather than reallocating, so a search pays no
+// per-query allocation for its visited set — the standard HNSW optimization
+// over a fresh map. Buffers are pooled and reused across searches.
+type visited struct {
+	stamp []uint32
+	gen   uint32
+}
+
+var visitedPool = sync.Pool{New: func() any { return &visited{} }}
+
+func getVisited(n int) *visited {
+	v := visitedPool.Get().(*visited)
+	if cap(v.stamp) < n {
+		v.stamp = make([]uint32, n)
+		v.gen = 0
+	}
+	v.stamp = v.stamp[:n]
+	// Advance the generation; on wraparound, reset the stamps once so stale
+	// marks from long ago can't be mistaken for the current generation.
+	v.gen++
+	if v.gen == 0 {
+		for i := range v.stamp {
+			v.stamp[i] = 0
+		}
+		v.gen = 1
+	}
+	return v
+}
+
+func putVisited(v *visited) { visitedPool.Put(v) }
+
+func (v *visited) seen(i int32) bool { return v.stamp[i] == v.gen }
+func (v *visited) mark(i int32)      { v.stamp[i] = v.gen }
 
 func (ix *Index) linksAt(i int32, l int) []int32 {
 	if l >= len(ix.nodes[i].links) {
