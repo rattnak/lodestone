@@ -15,12 +15,25 @@ B-tree store):
 |---|---|---|---|
 | Put, no fsync | **3.6 µs** | 42.6 µs | LSM writes are buffered log appends; the B-tree updates pages in place |
 | Put, fsync each | 5.9 ms | 11.4 ms | both dominated by the disk; fsync is the floor |
-| Get (hit, 100k keys) | 4.2 µs | **1.5 µs** | the B-tree searches one tree; the LSM may consult several tables |
-| Get (miss) | **0.33 µs** | — | the bloom filter skips the disk entirely |
+| Get (hit, 100k keys) | **1.1 µs** | 1.5 µs | after the tuning below, the LSM edges out the B-tree here too |
+| Get (miss) | **0.23 µs** | — | the bloom filter skips the disk entirely |
 
-The textbook LSM trade-off: **writes win big, point reads lose a little, misses
-are nearly free.** The gap widens with data size as the LSM keeps appending
-sequentially.
+The textbook LSM trade-off: **writes win big, misses are nearly free.** The gap
+widens with data size as the LSM keeps appending sequentially.
+
+**Read-path tuning.** The point-lookup path originally wrapped each SSTable read
+in a `bufio.Reader` (a 4 KB buffer per `Get`) and scanned lazily toward the end
+of the data section. Since the sparse index bounds the one interval a key can
+live in, the lookup now reads exactly that span into a pooled buffer and parses
+it in memory:
+
+| | before | after |
+|---|---|---|
+| Get (hit) | 2.73 µs · 5.35 KB/op · 21 allocs | **1.12 µs · 160 B/op · 3 allocs** |
+
+2.4× faster, 33× less memory. (Correctness is guarded by the engine's
+reference-model fuzz and crash-recovery property tests, which run under the
+race detector — the returned value is cloned before its buffer is recycled.)
 
 ## Vector index — HNSW vs brute force
 
@@ -83,5 +96,4 @@ go tool pprof -alloc_objects -http=:0 mem.out
 
 Known hot spots worth a look (noted for future tuning): the HNSW candidate
 heaps still allocate their backing arrays per search (pooling them is the next
-step after the visited-set win above), and the storage read path builds a
-fresh bufio reader per SSTable lookup.
+step after the visited-set win above).

@@ -10,6 +10,7 @@ import (
 	"iter"
 	"os"
 	"sort"
+	"sync"
 )
 
 // SSTable file format:
@@ -280,24 +281,86 @@ func (s *SSTable) Get(key []byte) (ent Entry, ok bool, err error) {
 	if i == 0 {
 		return Entry{}, false, nil // key sorts before the table's first key
 	}
+	// The key, if present, lies in this one sparse interval: from the sparse
+	// entry at or before it, up to the next sparse entry (or the end of the
+	// data). Read exactly that span into a pooled buffer and scan it in
+	// memory — no 4 KB bufio buffer, and no reading past the interval.
 	start := s.index[i-1].offset
-	r := bufio.NewReader(io.NewSectionReader(s.f, start, s.dataEnd-start))
-	for {
-		k, e, rerr := readSSTEntry(r)
-		if errors.Is(rerr, io.EOF) {
-			return Entry{}, false, nil
+	end := s.dataEnd
+	if i < len(s.index) {
+		end = s.index[i].offset
+	}
+	buf := getReadBuf(int(end - start))
+	defer putReadBuf(buf)
+	if _, err := s.f.ReadAt(buf, start); err != nil && err != io.EOF {
+		return Entry{}, false, err
+	}
+	for pos := 0; pos < len(buf); {
+		k, e, next, err := parseSSTEntry(buf, pos)
+		if err != nil {
+			return Entry{}, false, err
 		}
-		if rerr != nil {
-			return Entry{}, false, rerr
-		}
+		pos = next
 		switch c := bytes.Compare(k, key); {
 		case c == 0:
-			return e, true, nil
+			// e.Value aliases the pooled buffer; clone it so it survives
+			// after the buffer is recycled.
+			return Entry{Value: bytes.Clone(e.Value), Tombstone: e.Tombstone}, true, nil
 		case c > 0:
 			return Entry{}, false, nil
 		}
 	}
+	return Entry{}, false, nil
 }
+
+// read buffers are pooled across point lookups to avoid a per-Get allocation.
+var readBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
+func getReadBuf(n int) []byte {
+	bp := readBufPool.Get().(*[]byte)
+	b := *bp
+	if cap(b) < n {
+		b = make([]byte, n)
+	}
+	return b[:n]
+}
+
+func putReadBuf(b []byte) { readBufPool.Put(&b) }
+
+// parseSSTEntry decodes one entry from buf at pos, returning the key, entry,
+// and the position of the next entry. Key and value alias buf, so the caller
+// must copy them before the buffer is returned to the pool if they outlive the
+// lookup (Get returns copies via its callers' needs — the engine's Get copies).
+func parseSSTEntry(buf []byte, pos int) (key []byte, e Entry, next int, err error) {
+	if pos >= len(buf) {
+		return nil, Entry{}, pos, errTruncatedEntry
+	}
+	flags := buf[pos]
+	pos++
+	klen, n := binary.Uvarint(buf[pos:])
+	if n <= 0 {
+		return nil, Entry{}, pos, errTruncatedEntry
+	}
+	pos += n
+	if pos+int(klen) > len(buf) {
+		return nil, Entry{}, pos, errTruncatedEntry
+	}
+	key = buf[pos : pos+int(klen)]
+	pos += int(klen)
+	vlen, n := binary.Uvarint(buf[pos:])
+	if n <= 0 {
+		return nil, Entry{}, pos, errTruncatedEntry
+	}
+	pos += n
+	if pos+int(vlen) > len(buf) {
+		return nil, Entry{}, pos, errTruncatedEntry
+	}
+	value := buf[pos : pos+int(vlen)]
+	pos += int(vlen)
+	return key, Entry{Value: value, Tombstone: flags&1 != 0}, pos, nil
+}
+
+var errTruncatedEntry = errors.New("sstable: truncated entry")
 
 // All yields every entry, including tombstones, in ascending key order.
 // Compaction merges tables through this. A read error surfaces via the
