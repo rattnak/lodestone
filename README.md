@@ -91,6 +91,8 @@ go test ./internal/storage/ -bench . -run ^$     # benchmarks (see docs/BENCHMAR
 - [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — numbers and profiling.
 - [`learn/`](learn/) — a rebuild-it-yourself track: specs and tests to
   reconstruct each component from scratch.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how changes land: one branch, one
+  reviewed pull request, never a direct push to `main`.
 
 ## License
 
