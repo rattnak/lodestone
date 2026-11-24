@@ -94,4 +94,6 @@ go test ./internal/storage/ -bench . -run ^$     # benchmarks (see docs/BENCHMAR
 
 ## License
 
-[MIT](LICENSE)
+A personal, source-available project — published publicly to read and study,
+but **not open source**. All rights reserved; no use, copying, modification, or
+redistribution without permission. See [LICENSE](LICENSE).
