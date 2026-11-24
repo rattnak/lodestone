@@ -1,5 +1,7 @@
 name: CI
 
+# Runs on every pull request (and on main after merge). This is the required
+# status check that must pass before a PR can be merged into main.
 on:
   push:
     branches: [main]
@@ -13,6 +15,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+      - name: Format
+        run: |
+          # learn/ is a separate module with its own rules; exclude it.
+          unformatted=$(gofmt -l . | grep -v '^learn/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"
+            exit 1
+          fi
       - name: Build
         run: go build ./...
       - name: Vet
