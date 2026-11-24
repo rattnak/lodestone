@@ -50,9 +50,9 @@ type partition struct {
 	id   int
 	f    *os.File
 	buf  *bufio.Writer
-	size int64    // end of the last valid record
-	ends []int64  // ends[o] = byte offset just past record o; len == next offset
-	next uint64   // next offset to assign
+	size int64   // end of the last valid record
+	ends []int64 // ends[o] = byte offset just past record o; len == next offset
+	next uint64  // next offset to assign
 }
 
 // Open opens or creates a log with the given partition count under dir. The

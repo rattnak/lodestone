@@ -15,12 +15,12 @@ import (
 // commit replays the last message rather than dropping it. Downstream writes
 // must therefore be idempotent (the embedder dedupes by event id).
 type Consumer struct {
-	mu        sync.Mutex
-	log       *Log
-	group     string
-	offsets   []uint64 // committed next-offset per partition
-	path      string
-	cursors   []uint64 // in-flight read position per partition (>= committed)
+	mu      sync.Mutex
+	log     *Log
+	group   string
+	offsets []uint64 // committed next-offset per partition
+	path    string
+	cursors []uint64 // in-flight read position per partition (>= committed)
 }
 
 // NewConsumer opens (or creates) the offset store for group and loads any
